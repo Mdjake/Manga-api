@@ -218,7 +218,8 @@ class AnimeMangaDownloader:
                 })
             return None
     
-    def download_chapter_by_source_id(self, source_id, chapter_index=0, upload=False, title=None, progress_callback=None):
+    def download_chapter_by_source_id(self, source_id, chapter_index=0, title=None, progress_callback=None):
+        """Download chapter and always upload to Catbox"""
         try:
             if progress_callback:
                 progress_callback({
@@ -310,41 +311,40 @@ class AnimeMangaDownloader:
             # Create PDF
             pdf_path = self.create_pdf(images, actual_title, progress_callback)
             
-            result = {
-                'success': True,
-                'title': actual_title,
-                'source_id': source_id,
-                'chapter': chapter_num,
-                'total_pages': len(images),
-                'local_file': pdf_path
-            }
+            # Always upload to Catbox
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_title = re.sub(r'[^a-zA-Z0-9\s\-_]', '', actual_title).rstrip()
+            filename = f"{safe_title}_Chapter_{chapter_num}_{timestamp}.pdf"
+            download_url = self.upload_to_catbox(pdf_path, filename, progress_callback)
             
-            # Upload to Catbox if requested
-            if upload:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_title = re.sub(r'[^a-zA-Z0-9\s\-_]', '', actual_title).rstrip()
-                filename = f"{safe_title}_Chapter_{chapter_num}_{timestamp}.pdf"
-                download_url = self.upload_to_catbox(pdf_path, filename, progress_callback)
-                
-                if download_url:
-                    result['download_url'] = download_url
-                    result['filename'] = filename
-                    # Clean up local file after upload
-                    try:
-                        os.unlink(pdf_path)
-                    except:
-                        pass
-                else:
-                    result['upload_failed'] = True
-                    result['local_file'] = pdf_path  # Keep local file if upload failed
+            # Clean up local file after upload
+            try:
+                os.unlink(pdf_path)
+            except:
+                pass
+            
+            if download_url:
+                result = {
+                    'success': True,
+                    'title': actual_title,
+                    'source_id': source_id,
+                    'chapter': chapter_num,
+                    'total_pages': len(images),
+                    'download_url': download_url,
+                    'filename': filename
+                }
             else:
-                # Keep local file for download
-                result['local_file'] = pdf_path
-                if progress_callback:
-                    progress_callback({
-                        'type': 'no_upload',
-                        'status': 'PDF saved locally (no upload)'
-                    })
+                # If upload failed, return local file as fallback
+                result = {
+                    'success': True,
+                    'title': actual_title,
+                    'source_id': source_id,
+                    'chapter': chapter_num,
+                    'total_pages': len(images),
+                    'local_file': pdf_path,
+                    'upload_failed': True,
+                    'message': 'Upload failed, file saved locally'
+                }
             
             if progress_callback:
                 progress_callback({
@@ -368,28 +368,27 @@ def home():
     return jsonify({
         'name': 'Manga Downloader API',
         'version': '1.0.0',
+        'description': 'Downloads manga chapters and uploads to cloud automatically',
         'endpoints': {
             '/search': 'GET - Search for manga (use ?query=name)',
-            '/download': 'GET - Download with streaming progress',
+            '/download': 'GET - Download chapter with streaming progress',
             '/download_json': 'GET - Download as JSON (no streaming)',
             '/health': 'GET - Health check'
         },
+        'features': {
+            'auto_upload': 'Always uploads to Catbox cloud storage',
+            'download_link': 'Returns a shareable download link',
+            'streaming_progress': 'Real-time progress updates',
+            'parallel_downloads': 'Fast parallel image downloads'
+        },
         'usage_examples': {
             'search': 'https://your-api.vercel.app/search?query=naruto',
-            'download_default': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1',
-            'download_with_upload': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&upload=true',
+            'download_stream': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1',
             'download_no_stream': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&stream=false'
-        },
-        'defaults': {
-            'upload': 'false (off by default)',
-            'stream': 'true (shows progress)',
-            'chapter': '0 (first chapter)',
-            'workers': '10'
         },
         'parameters': {
             'source_id': 'Source ID from search results (required)',
             'chapter': 'Chapter number (0 = first, default: 0)',
-            'upload': 'Upload to cloud (true/false, default: false)',
             'stream': 'Stream progress (true/false, default: true)',
             'workers': 'Parallel downloads (5-20, default: 10)'
         }
@@ -438,35 +437,30 @@ def search():
 
 @app.route('/download', methods=['GET'])
 def download():
-    """Download with streaming progress and upload option"""
+    """Download with streaming progress - always uploads to cloud"""
     try:
         source_id = request.args.get('source_id')
         if not source_id:
             return jsonify({
                 'success': False, 
                 'error': 'Missing source_id parameter',
-                'usage': '?source_id=naruto.1205&chapter=1&upload=false&stream=true'
+                'usage': '?source_id=naruto.1205&chapter=1&stream=true'
             }), 400
         
         chapter = int(request.args.get('chapter', 0))
-        upload = request.args.get('upload', 'false').lower() == 'true'  # Default: false
         max_workers = int(request.args.get('workers', 10))
         title = request.args.get('title')
-        stream = request.args.get('stream', 'true').lower() == 'true'  # Default: true
+        stream = request.args.get('stream', 'true').lower() == 'true'
         
         max_workers = min(max(5, max_workers), 20)
         
-        # Non-streaming: return file directly
+        # Non-streaming: return JSON with download link
         if not stream:
             downloader = AnimeMangaDownloader(max_workers=max_workers)
-            result = downloader.download_chapter_by_source_id(source_id, chapter, upload, title)
+            result = downloader.download_chapter_by_source_id(source_id, chapter, title)
             
-            if result['success'] and 'local_file' in result:
-                file_path = result['local_file']
-                filename = f"{result['title']}_Chapter_{result['chapter']}.pdf"
-                
-                # If uploaded, return JSON with download URL
-                if upload and result.get('download_url'):
+            if result['success']:
+                if result.get('download_url'):
                     return jsonify({
                         'success': True,
                         'title': result['title'],
@@ -474,15 +468,14 @@ def download():
                         'total_pages': result['total_pages'],
                         'download_url': result['download_url'],
                         'filename': result.get('filename'),
-                        'mode': 'cloud_upload'
+                        'message': 'PDF uploaded successfully! Use the download_url to access your file.'
                     })
-                else:
-                    # Return file directly
+                elif result.get('local_file'):
+                    # Upload failed, return file directly
                     return send_file(
-                        file_path,
+                        result['local_file'],
                         as_attachment=True,
-                        download_name=filename,
-                        mimetype='application/pdf'
+                        download_name=f"{result['title']}_Chapter_{result['chapter']}.pdf"
                     )
             else:
                 return jsonify({'success': False, 'error': result.get('error', 'Download failed')}), 400
@@ -505,7 +498,7 @@ def download():
             def download_thread():
                 try:
                     result = downloader.download_chapter_by_source_id(
-                        source_id, chapter, upload, title, progress_callback
+                        source_id, chapter, title, progress_callback
                     )
                     result_container['result'] = result
                 except Exception as e:
@@ -538,16 +531,13 @@ def download():
                         'total_pages': result['total_pages']
                     }
                     
-                    if upload and result.get('download_url'):
-                        # Uploaded to cloud
+                    if result.get('download_url'):
                         response_data['download_url'] = result['download_url']
                         response_data['filename'] = result.get('filename')
-                        response_data['mode'] = 'cloud_upload'
-                    else:
-                        # No upload - local file
-                        response_data['mode'] = 'local_only'
-                        response_data['local_file'] = result.get('local_file')
-                        response_data['message'] = 'PDF saved locally. Use stream=false to download directly.'
+                        response_data['message'] = 'PDF uploaded successfully! Use the download_url to access your file.'
+                    elif result.get('local_file'):
+                        response_data['local_file'] = result['local_file']
+                        response_data['message'] = 'Upload failed, file saved locally'
                     
                     yield f"data: {json.dumps({'type': 'complete', 'result': response_data})}\n\n"
                 else:
@@ -573,7 +563,7 @@ def download():
 
 @app.route('/download_json', methods=['GET'])
 def download_json():
-    """Non-streaming JSON response"""
+    """Non-streaming JSON response - always uploads to cloud"""
     try:
         source_id = request.args.get('source_id')
         if not source_id:
@@ -583,45 +573,32 @@ def download_json():
             }), 400
         
         chapter = int(request.args.get('chapter', 0))
-        upload = request.args.get('upload', 'false').lower() == 'true'  # Default: false
         max_workers = int(request.args.get('workers', 10))
         title = request.args.get('title')
         
         max_workers = min(max(5, max_workers), 20)
         
         downloader = AnimeMangaDownloader(max_workers=max_workers)
-        result = downloader.download_chapter_by_source_id(source_id, chapter, upload, title)
+        result = downloader.download_chapter_by_source_id(source_id, chapter, title)
         
         if result['success']:
-            response_data = {
-                'success': True,
-                'title': result['title'],
-                'source_id': source_id,
-                'chapter': result['chapter'],
-                'total_pages': result['total_pages']
-            }
-            
-            if upload and result.get('download_url'):
-                response_data['download_url'] = result['download_url']
-                response_data['filename'] = result.get('filename')
-                response_data['mode'] = 'cloud_upload'
-                # Clean up local file if exists
-                if 'local_file' in result:
-                    try:
-                        os.unlink(result['local_file'])
-                    except:
-                        pass
-                return jsonify(response_data)
-            else:
-                # Return file directly for download
-                if 'local_file' in result:
-                    return send_file(
-                        result['local_file'],
-                        as_attachment=True,
-                        download_name=f"{result['title']}_Chapter_{result['chapter']}.pdf"
-                    )
-            
-            return jsonify(response_data)
+            if result.get('download_url'):
+                return jsonify({
+                    'success': True,
+                    'title': result['title'],
+                    'chapter': result['chapter'],
+                    'total_pages': result['total_pages'],
+                    'download_url': result['download_url'],
+                    'filename': result.get('filename'),
+                    'message': 'PDF uploaded successfully! Use the download_url to access your file.'
+                })
+            elif result.get('local_file'):
+                # Upload failed, return file directly
+                return send_file(
+                    result['local_file'],
+                    as_attachment=True,
+                    download_name=f"{result['title']}_Chapter_{result['chapter']}.pdf"
+                )
         else:
             return jsonify({'success': False, 'error': result.get('error')}), 400
         
