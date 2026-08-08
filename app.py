@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 import requests
 import json
 import os
@@ -12,6 +12,7 @@ import threading
 import base64
 from datetime import datetime
 import re
+import queue
 
 app = Flask(__name__)
 
@@ -31,6 +32,7 @@ class AnimeMangaDownloader:
         self.progress_lock = threading.Lock()
         self.downloaded_count = 0
         self.total_pages = 0
+        self.progress_queue = None
     
     def search(self, query):
         url = f"{self.base_url}/api/manga?action=search&q={query}"
@@ -65,6 +67,16 @@ class AnimeMangaDownloader:
                     
                     with self.progress_lock:
                         self.downloaded_count += 1
+                        if self.progress_queue:
+                            try:
+                                self.progress_queue.put_nowait({
+                                    'type': 'progress',
+                                    'current': self.downloaded_count,
+                                    'total': self.total_pages,
+                                    'status': f'Downloaded page {self.downloaded_count}/{self.total_pages}'
+                                })
+                            except:
+                                pass
                     
                     return (index, img)
             except Exception as e:
@@ -74,9 +86,16 @@ class AnimeMangaDownloader:
                     return (index, None)
         return (index, None)
     
-    def download_images_parallel(self, page_urls):
+    def download_images_parallel(self, page_urls, progress_callback=None):
         self.total_pages = len(page_urls)
         self.downloaded_count = 0
+        
+        if progress_callback:
+            progress_callback({
+                'type': 'start',
+                'total': self.total_pages,
+                'status': f'Starting download of {self.total_pages} pages'
+            })
         
         download_tasks = [(url, i) for i, url in enumerate(page_urls)]
         images = [None] * len(page_urls)
@@ -92,14 +111,39 @@ class AnimeMangaDownloader:
                 if img:
                     images[index] = img
         
-        return [img for img in images if img is not None]
+        successful_images = [img for img in images if img is not None]
+        
+        if progress_callback:
+            progress_callback({
+                'type': 'complete',
+                'downloaded': len(successful_images),
+                'total': self.total_pages,
+                'status': f'Downloaded {len(successful_images)}/{self.total_pages} pages'
+            })
+        
+        return successful_images
     
-    def create_pdf(self, images, title="Manga"):
+    def create_pdf(self, images, title="Manga", progress_callback=None):
         pdf = FPDF(unit="pt", format="A4")
         a4_width = 595
         a4_height = 842
         
-        for img in images:
+        if progress_callback:
+            progress_callback({
+                'type': 'pdf_start',
+                'total': len(images),
+                'status': f'Creating PDF with {len(images)} pages'
+            })
+        
+        for idx, img in enumerate(images):
+            if progress_callback and idx % 5 == 0:
+                progress_callback({
+                    'type': 'pdf_progress',
+                    'current': idx + 1,
+                    'total': len(images),
+                    'status': f'Adding page {idx + 1}/{len(images)} to PDF'
+                })
+            
             max_dimension = 2000
             if img.width > max_dimension or img.height > max_dimension:
                 img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
@@ -128,10 +172,23 @@ class AnimeMangaDownloader:
         pdf_output = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
         pdf.output(pdf_output.name)
         pdf_output.close()
+        
+        if progress_callback:
+            progress_callback({
+                'type': 'pdf_complete',
+                'status': 'PDF created successfully'
+            })
+        
         return pdf_output.name
     
-    def upload_to_catbox(self, file_path, file_name):
+    def upload_to_catbox(self, file_path, file_name, progress_callback=None):
         try:
+            if progress_callback:
+                progress_callback({
+                    'type': 'upload_start',
+                    'status': f'Uploading to cloud: {file_name}'
+                })
+            
             with open(file_path, 'rb') as f:
                 files = {'file': (file_name, f, 'application/pdf')}
                 response = self.session.post(
@@ -143,27 +200,44 @@ class AnimeMangaDownloader:
                 if response.status_code == 200:
                     result = response.json()
                     if result.get('success'):
-                        return result.get('url')
+                        url = result.get('url')
+                        if progress_callback:
+                            progress_callback({
+                                'type': 'upload_complete',
+                                'url': url,
+                                'status': 'Upload complete!'
+                            })
+                        return url
                 return None
         except Exception as e:
+            if progress_callback:
+                progress_callback({
+                    'type': 'upload_error',
+                    'error': str(e),
+                    'status': 'Upload failed'
+                })
             return None
     
-    def download_chapter(self, search_query, chapter_index=0, upload=True):
+    def download_chapter_by_source_id(self, source_id, chapter_index=0, upload=True, title=None, progress_callback=None):
         try:
-            # Search
-            search_result = self.search(search_query)
-            if not search_result.get('results'):
-                return {'success': False, 'error': 'No results found'}
-            
-            results = search_result['results']
-            selected = results[0]
-            source_id = selected.get('sourceId')
-            title = selected.get('name', selected.get('title', 'Unknown Title'))
+            if progress_callback:
+                progress_callback({
+                    'type': 'start',
+                    'status': f'Starting download for source: {source_id}'
+                })
             
             # Get chapters
+            if progress_callback:
+                progress_callback({
+                    'type': 'fetching_chapters',
+                    'status': 'Fetching chapters...'
+                })
+            
             chapters_result = self.get_chapters(source_id)
             if not chapters_result.get('chapters'):
                 return {'success': False, 'error': 'No chapters found'}
+            
+            actual_title = chapters_result.get('title', title or 'Manga')
             
             # Process chapters
             chapters_list = []
@@ -189,7 +263,21 @@ class AnimeMangaDownloader:
             chapter_id = chapter_data['id']
             chapter_num = chapter_data['number']
             
+            if progress_callback:
+                progress_callback({
+                    'type': 'chapter_found',
+                    'chapter': chapter_num,
+                    'total_chapters': len(chapters_list),
+                    'status': f'Selected Chapter {chapter_num}'
+                })
+            
             # Get pages
+            if progress_callback:
+                progress_callback({
+                    'type': 'fetching_pages',
+                    'status': 'Fetching page URLs...'
+                })
+            
             pages_result = self.get_pages(chapter_id)
             if not pages_result.get('pages'):
                 return {'success': False, 'error': 'No pages found'}
@@ -207,17 +295,25 @@ class AnimeMangaDownloader:
             if not page_urls:
                 return {'success': False, 'error': 'No valid page URLs found'}
             
+            if progress_callback:
+                progress_callback({
+                    'type': 'pages_found',
+                    'total_pages': len(page_urls),
+                    'status': f'Found {len(page_urls)} pages'
+                })
+            
             # Download images
-            images = self.download_images_parallel(page_urls)
+            images = self.download_images_parallel(page_urls, progress_callback)
             if not images:
                 return {'success': False, 'error': 'Failed to download images'}
             
             # Create PDF
-            pdf_path = self.create_pdf(images, title)
+            pdf_path = self.create_pdf(images, actual_title, progress_callback)
             
             result = {
                 'success': True,
-                'title': title,
+                'title': actual_title,
+                'source_id': source_id,
                 'chapter': chapter_num,
                 'total_pages': len(images),
                 'local_file': pdf_path
@@ -226,17 +322,29 @@ class AnimeMangaDownloader:
             # Upload to Catbox
             if upload:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_title = re.sub(r'[^a-zA-Z0-9\s\-_]', '', title).rstrip()
+                safe_title = re.sub(r'[^a-zA-Z0-9\s\-_]', '', actual_title).rstrip()
                 filename = f"{safe_title}_Chapter_{chapter_num}_{timestamp}.pdf"
-                download_url = self.upload_to_catbox(pdf_path, filename)
+                download_url = self.upload_to_catbox(pdf_path, filename, progress_callback)
                 
                 if download_url:
                     result['download_url'] = download_url
                     result['filename'] = filename
             
+            if progress_callback:
+                progress_callback({
+                    'type': 'done',
+                    'status': 'Download complete!'
+                })
+            
             return result
             
         except Exception as e:
+            if progress_callback:
+                progress_callback({
+                    'type': 'error',
+                    'error': str(e),
+                    'status': f'Error: {str(e)}'
+                })
             return {'success': False, 'error': str(e)}
 
 @app.route('/', methods=['GET'])
@@ -246,24 +354,14 @@ def home():
         'version': '1.0.0',
         'endpoints': {
             '/search': 'GET - Search for manga (use ?query=name)',
-            '/download': 'GET - Download chapter (use ?query=name&chapter=0&upload=true)',
+            '/download': 'GET - Download chapter with progress stream (use ?source_id=xxx&chapter=0&upload=true&stream=true)',
+            '/download_json': 'GET - Download chapter as JSON (no streaming)',
             '/health': 'GET - Health check'
         },
         'usage_examples': {
             'search': 'https://your-api.vercel.app/search?query=naruto',
-            'download': 'https://your-api.vercel.app/download?query=naruto&chapter=1&upload=true',
-            'download_no_upload': 'https://your-api.vercel.app/download?query=naruto&chapter=1&upload=false'
-        },
-        'parameters': {
-            'search': {
-                'query': 'Manga name to search (required)'
-            },
-            'download': {
-                'query': 'Manga name (required)',
-                'chapter': 'Chapter number (0 = first, default: 0)',
-                'upload': 'Upload to cloud (true/false, default: true)',
-                'workers': 'Parallel downloads (5-20, default: 10)'
-            }
+            'download_stream': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&stream=true',
+            'download_json': 'https://your-api.vercel.app/download_json?source_id=naruto.1205&chapter=1'
         }
     })
 
@@ -288,9 +386,8 @@ def search():
         if not result.get('results'):
             return jsonify({'success': False, 'error': 'No results found'}), 404
         
-        # Format results
         formatted_results = []
-        for idx, item in enumerate(result['results'][:20]):  # Limit to 20 results
+        for idx, item in enumerate(result['results'][:20]):
             formatted_results.append({
                 'index': idx + 1,
                 'title': item.get('name', item.get('title', 'Unknown')),
@@ -310,38 +407,143 @@ def search():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/download', methods=['GET'])
-def download():
+def download_stream():
+    """Download with streaming progress"""
     try:
-        # Get parameters from URL
-        query = request.args.get('query')
-        if not query:
+        source_id = request.args.get('source_id')
+        if not source_id:
             return jsonify({
                 'success': False, 
-                'error': 'Missing query parameter',
-                'usage': '?query=naruto&chapter=1&upload=true'
+                'error': 'Missing source_id parameter',
+                'usage': '?source_id=naruto.1205&chapter=1&stream=true'
             }), 400
         
         chapter = int(request.args.get('chapter', 0))
         upload = request.args.get('upload', 'true').lower() == 'true'
         max_workers = int(request.args.get('workers', 10))
+        title = request.args.get('title')
+        stream = request.args.get('stream', 'true').lower() == 'true'
         
-        # Limit workers to prevent abuse
+        max_workers = min(max(5, max_workers), 20)
+        
+        def generate():
+            progress_queue = queue.Queue()
+            
+            def progress_callback(data):
+                try:
+                    progress_queue.put_nowait(data)
+                except:
+                    pass
+            
+            downloader = AnimeMangaDownloader(max_workers=max_workers)
+            downloader.progress_queue = progress_queue
+            
+            # Start download in a separate thread
+            result_container = {'result': None, 'error': None}
+            
+            def download_thread():
+                try:
+                    result = downloader.download_chapter_by_source_id(
+                        source_id, chapter, upload, title, progress_callback
+                    )
+                    result_container['result'] = result
+                except Exception as e:
+                    result_container['error'] = str(e)
+            
+            thread = threading.Thread(target=download_thread)
+            thread.start()
+            
+            # Stream progress events
+            yield f"data: {json.dumps({'type': 'connected', 'status': 'Connected to download stream'})}\n\n"
+            
+            while thread.is_alive() or not progress_queue.empty():
+                try:
+                    data = progress_queue.get(timeout=0.5)
+                    if data:
+                        yield f"data: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    continue
+            
+            # Check final result
+            if result_container['result']:
+                result = result_container['result']
+                if result.get('success'):
+                    # Clean up local file if uploaded
+                    if upload and 'local_file' in result:
+                        try:
+                            os.unlink(result['local_file'])
+                        except:
+                            pass
+                    
+                    yield f"data: {json.dumps({'type': 'complete', 'result': result})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'error': result.get('error', 'Unknown error')})}\n\n"
+            elif result_container['error']:
+                yield f"data: {json.dumps({'type': 'error', 'error': result_container['error']})}\n\n"
+            
+            yield "data: {}\n\n".format(json.dumps({'type': 'end'}))
+        
+        if stream:
+            return Response(
+                stream_with_context(generate()),
+                mimetype='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'X-Accel-Buffering': 'no'
+                }
+            )
+        else:
+            # Non-streaming version
+            downloader = AnimeMangaDownloader(max_workers=max_workers)
+            result = downloader.download_chapter_by_source_id(source_id, chapter, upload, title)
+            
+            if result['success']:
+                if upload and 'local_file' in result:
+                    try:
+                        os.unlink(result['local_file'])
+                    except:
+                        pass
+                
+                return jsonify({
+                    'success': True,
+                    'title': result['title'],
+                    'source_id': source_id,
+                    'chapter': result['chapter'],
+                    'total_pages': result['total_pages'],
+                    'download_url': result.get('download_url'),
+                    'filename': result.get('filename')
+                })
+            else:
+                return jsonify({'success': False, 'error': result.get('error')}), 400
+        
+    except ValueError as e:
+        return jsonify({'success': False, 'error': 'Invalid parameter value'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/download_json', methods=['GET'])
+def download_json():
+    """Non-streaming version (returns JSON)"""
+    try:
+        source_id = request.args.get('source_id')
+        if not source_id:
+            return jsonify({
+                'success': False, 
+                'error': 'Missing source_id parameter'
+            }), 400
+        
+        chapter = int(request.args.get('chapter', 0))
+        upload = request.args.get('upload', 'true').lower() == 'true'
+        max_workers = int(request.args.get('workers', 10))
+        title = request.args.get('title')
+        
         max_workers = min(max(5, max_workers), 20)
         
         downloader = AnimeMangaDownloader(max_workers=max_workers)
-        result = downloader.download_chapter(query, chapter, upload)
+        result = downloader.download_chapter_by_source_id(source_id, chapter, upload, title)
         
         if result['success']:
-            # If not uploaded, return the file
-            if not upload and 'local_file' in result:
-                return send_file(
-                    result['local_file'],
-                    as_attachment=True,
-                    download_name=f"{result['title']}_Chapter_{result['chapter']}.pdf"
-                )
-            
-            # Clean up local file
-            if 'local_file' in result:
+            if upload and 'local_file' in result:
                 try:
                     os.unlink(result['local_file'])
                 except:
@@ -350,21 +552,20 @@ def download():
             return jsonify({
                 'success': True,
                 'title': result['title'],
+                'source_id': source_id,
                 'chapter': result['chapter'],
                 'total_pages': result['total_pages'],
-                'download_url': result.get('download_url', None),
-                'filename': result.get('filename', None),
-                'message': 'PDF uploaded successfully! Use the download_url to access your file.'
+                'download_url': result.get('download_url'),
+                'filename': result.get('filename')
             })
         else:
-            return jsonify({'success': False, 'error': result.get('error', 'Download failed')}), 400
+            return jsonify({'success': False, 'error': result.get('error')}), 400
         
     except ValueError as e:
         return jsonify({'success': False, 'error': 'Invalid parameter value'}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# For Vercel serverless
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)
