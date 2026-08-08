@@ -245,22 +245,24 @@ def home():
         'name': 'Manga Downloader API',
         'version': '1.0.0',
         'endpoints': {
-            '/search': 'POST - Search for manga',
-            '/download': 'POST - Download chapter',
+            '/search': 'GET - Search for manga (use ?query=name)',
+            '/download': 'GET - Download chapter (use ?query=name&chapter=0&upload=true)',
             '/health': 'GET - Health check'
         },
-        'usage': {
+        'usage_examples': {
+            'search': 'https://your-api.vercel.app/search?query=naruto',
+            'download': 'https://your-api.vercel.app/download?query=naruto&chapter=1&upload=true',
+            'download_no_upload': 'https://your-api.vercel.app/download?query=naruto&chapter=1&upload=false'
+        },
+        'parameters': {
             'search': {
-                'method': 'POST',
-                'body': {'query': 'manga_name'}
+                'query': 'Manga name to search (required)'
             },
             'download': {
-                'method': 'POST',
-                'body': {
-                    'query': 'manga_name',
-                    'chapter': 0,
-                    'upload': True
-                }
+                'query': 'Manga name (required)',
+                'chapter': 'Chapter number (0 = first, default: 0)',
+                'upload': 'Upload to cloud (true/false, default: true)',
+                'workers': 'Parallel downloads (5-20, default: 10)'
             }
         }
     })
@@ -269,14 +271,17 @@ def home():
 def health():
     return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
 
-@app.route('/search', methods=['POST'])
+@app.route('/search', methods=['GET'])
 def search():
     try:
-        data = request.get_json()
-        if not data or 'query' not in data:
-            return jsonify({'success': False, 'error': 'Missing query parameter'}), 400
+        query = request.args.get('query')
+        if not query:
+            return jsonify({
+                'success': False, 
+                'error': 'Missing query parameter',
+                'usage': '?query=naruto'
+            }), 400
         
-        query = data['query']
         downloader = AnimeMangaDownloader(max_workers=10)
         result = downloader.search(query)
         
@@ -304,17 +309,24 @@ def search():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/download', methods=['POST'])
+@app.route('/download', methods=['GET'])
 def download():
     try:
-        data = request.get_json()
-        if not data or 'query' not in data:
-            return jsonify({'success': False, 'error': 'Missing query parameter'}), 400
+        # Get parameters from URL
+        query = request.args.get('query')
+        if not query:
+            return jsonify({
+                'success': False, 
+                'error': 'Missing query parameter',
+                'usage': '?query=naruto&chapter=1&upload=true'
+            }), 400
         
-        query = data['query']
-        chapter = data.get('chapter', 0)
-        upload = data.get('upload', True)
-        max_workers = data.get('max_workers', 10)
+        chapter = int(request.args.get('chapter', 0))
+        upload = request.args.get('upload', 'true').lower() == 'true'
+        max_workers = int(request.args.get('workers', 10))
+        
+        # Limit workers to prevent abuse
+        max_workers = min(max(5, max_workers), 20)
         
         downloader = AnimeMangaDownloader(max_workers=max_workers)
         result = downloader.download_chapter(query, chapter, upload)
@@ -341,29 +353,18 @@ def download():
                 'chapter': result['chapter'],
                 'total_pages': result['total_pages'],
                 'download_url': result.get('download_url', None),
-                'filename': result.get('filename', None)
+                'filename': result.get('filename', None),
+                'message': 'PDF uploaded successfully! Use the download_url to access your file.'
             })
         else:
             return jsonify({'success': False, 'error': result.get('error', 'Download failed')}), 400
         
+    except ValueError as e:
+        return jsonify({'success': False, 'error': 'Invalid parameter value'}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/downloads/<filename>', methods=['GET'])
-def get_download(filename):
-    """Serve downloaded files (for local testing)"""
-    try:
-        return send_file(
-            os.path.join('/tmp', filename),
-            as_attachment=True,
-            download_name=filename
-        )
-    except:
-        return jsonify({'success': False, 'error': 'File not found'}), 404
-
 # For Vercel serverless
-from flask import Flask
-
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
