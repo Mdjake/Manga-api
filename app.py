@@ -218,7 +218,7 @@ class AnimeMangaDownloader:
                 })
             return None
     
-    def download_chapter_by_source_id(self, source_id, chapter_index=0, upload=True, title=None, progress_callback=None):
+    def download_chapter_by_source_id(self, source_id, chapter_index=0, upload=False, title=None, progress_callback=None):
         try:
             if progress_callback:
                 progress_callback({
@@ -376,14 +376,20 @@ def home():
         },
         'usage_examples': {
             'search': 'https://your-api.vercel.app/search?query=naruto',
-            'download_with_upload': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&upload=true&stream=true',
-            'download_without_upload': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&upload=false&stream=true',
-            'direct_file': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&upload=false&stream=false'
+            'download_default': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1',
+            'download_with_upload': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&upload=true',
+            'download_no_stream': 'https://your-api.vercel.app/download?source_id=naruto.1205&chapter=1&stream=false'
+        },
+        'defaults': {
+            'upload': 'false (off by default)',
+            'stream': 'true (shows progress)',
+            'chapter': '0 (first chapter)',
+            'workers': '10'
         },
         'parameters': {
             'source_id': 'Source ID from search results (required)',
             'chapter': 'Chapter number (0 = first, default: 0)',
-            'upload': 'Upload to cloud (true/false, default: true)',
+            'upload': 'Upload to cloud (true/false, default: false)',
             'stream': 'Stream progress (true/false, default: true)',
             'workers': 'Parallel downloads (5-20, default: 10)'
         }
@@ -439,19 +445,19 @@ def download():
             return jsonify({
                 'success': False, 
                 'error': 'Missing source_id parameter',
-                'usage': '?source_id=naruto.1205&chapter=1&upload=true&stream=true'
+                'usage': '?source_id=naruto.1205&chapter=1&upload=false&stream=true'
             }), 400
         
         chapter = int(request.args.get('chapter', 0))
-        upload = request.args.get('upload', 'true').lower() == 'true'
+        upload = request.args.get('upload', 'false').lower() == 'true'  # Default: false
         max_workers = int(request.args.get('workers', 10))
         title = request.args.get('title')
-        stream = request.args.get('stream', 'true').lower() == 'true'
+        stream = request.args.get('stream', 'true').lower() == 'true'  # Default: true
         
         max_workers = min(max(5, max_workers), 20)
         
-        # Non-streaming: return file directly when upload=false
-        if not stream and not upload:
+        # Non-streaming: return file directly
+        if not stream:
             downloader = AnimeMangaDownloader(max_workers=max_workers)
             result = downloader.download_chapter_by_source_id(source_id, chapter, upload, title)
             
@@ -459,12 +465,25 @@ def download():
                 file_path = result['local_file']
                 filename = f"{result['title']}_Chapter_{result['chapter']}.pdf"
                 
-                return send_file(
-                    file_path,
-                    as_attachment=True,
-                    download_name=filename,
-                    mimetype='application/pdf'
-                )
+                # If uploaded, return JSON with download URL
+                if upload and result.get('download_url'):
+                    return jsonify({
+                        'success': True,
+                        'title': result['title'],
+                        'chapter': result['chapter'],
+                        'total_pages': result['total_pages'],
+                        'download_url': result['download_url'],
+                        'filename': result.get('filename'),
+                        'mode': 'cloud_upload'
+                    })
+                else:
+                    # Return file directly
+                    return send_file(
+                        file_path,
+                        as_attachment=True,
+                        download_name=filename,
+                        mimetype='application/pdf'
+                    )
             else:
                 return jsonify({'success': False, 'error': result.get('error', 'Download failed')}), 400
         
@@ -482,7 +501,6 @@ def download():
             downloader.progress_queue = progress_queue
             
             result_container = {'result': None, 'error': None}
-            file_to_cleanup = []
             
             def download_thread():
                 try:
@@ -490,8 +508,6 @@ def download():
                         source_id, chapter, upload, title, progress_callback
                     )
                     result_container['result'] = result
-                    if result and 'local_file' in result:
-                        file_to_cleanup.append(result['local_file'])
                 except Exception as e:
                     result_container['error'] = str(e)
             
@@ -514,7 +530,6 @@ def download():
             if result_container['result']:
                 result = result_container['result']
                 if result.get('success'):
-                    # Prepare response based on upload flag
                     response_data = {
                         'success': True,
                         'title': result['title'],
@@ -528,14 +543,11 @@ def download():
                         response_data['download_url'] = result['download_url']
                         response_data['filename'] = result.get('filename')
                         response_data['mode'] = 'cloud_upload'
-                    elif upload and result.get('local_file'):
-                        # Upload failed, keep local
-                        response_data['local_file'] = result['local_file']
-                        response_data['mode'] = 'local_fallback'
                     else:
-                        # No upload
-                        response_data['local_file'] = result['local_file']
+                        # No upload - local file
                         response_data['mode'] = 'local_only'
+                        response_data['local_file'] = result.get('local_file')
+                        response_data['message'] = 'PDF saved locally. Use stream=false to download directly.'
                     
                     yield f"data: {json.dumps({'type': 'complete', 'result': response_data})}\n\n"
                 else:
@@ -571,7 +583,7 @@ def download_json():
             }), 400
         
         chapter = int(request.args.get('chapter', 0))
-        upload = request.args.get('upload', 'true').lower() == 'true'
+        upload = request.args.get('upload', 'false').lower() == 'true'  # Default: false
         max_workers = int(request.args.get('workers', 10))
         title = request.args.get('title')
         
@@ -599,6 +611,7 @@ def download_json():
                         os.unlink(result['local_file'])
                     except:
                         pass
+                return jsonify(response_data)
             else:
                 # Return file directly for download
                 if 'local_file' in result:
